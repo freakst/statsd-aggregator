@@ -926,6 +926,15 @@ int read_config(char *config){
     process_config_setting(config_setting_get_elem(root, i));
   }
 
+  if (signal(SIGHUP, on_sighup) == SIG_ERR) {
+      log_msg(ERROR, "%s: signal() failed", __func__);
+      return 1;
+  }
+  if (signal(SIGINT, on_sigint) == SIG_ERR) {
+      log_msg(ERROR, "%s: signal() failed", __func__);
+      return 1;
+  }
+
   return 1;
 }
 
