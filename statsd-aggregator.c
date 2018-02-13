@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <netinet/in.h>
 #include <ev.h>
+#include <libconfig.h>
 #include <netdb.h>
 #include <sys/fcntl.h>
 #include <time.h>
@@ -22,7 +23,7 @@
 
 // Size of buffer for outgoing packets. Should be below MTU.
 // TODO Probably should be configured via configuration file?
-#define DOWNSTREAM_BUF_SIZE 1450
+#define DOWNSTREAM_BUF_SIZE 1428
 #define DOWNSTREAM_BUF_NUM 16
 // Size of other temporary buffers
 #define DATA_BUF_SIZE 4096
@@ -109,22 +110,42 @@ struct downstream_s {
     struct downstream_host_s *current_downstream_host;
 };
 
+typedef struct downstream_node_s {
+    struct downstream_s data;
+    struct downstream_node_s* next;
+} downstream_node_t;
+
 // globally accessed structure with commonly used data
 struct global_s {
     // port we are listening on
     int data_port;
+
     struct downstream_s downstream;
+    struct downstream_node_t *downstreams;
+
+    // config_file location
+    char *config_file;
     // how often we flush data
     ev_tstamp downstream_flush_interval;
     // how noisy is our log
     int log_level;
+    int loglevel;
     // how often we want to check if downstream ips were changed
     int dns_refresh_interval;
     // how often we check health of the downstreams
     ev_tstamp downstream_health_check_interval;
+
 };
 
 struct global_s global;
+
+// host settings
+struct host_s {
+  char *name;
+  char *host;
+  unsigned int sink_port;
+  unsigned int hc_port;
+};
 
 // numeric values for log levels
 enum log_level_e {
@@ -147,6 +168,8 @@ char *log_level_name(enum log_level_e level) {
     return name[level];
 }
 
+void get_dns_data(struct downstream_s *downstream);
+
 // function to log message
 void log_msg(int level, char *format, ...) {
     va_list args;
@@ -167,6 +190,37 @@ void log_msg(int level, char *format, ...) {
     va_end(args);
     fprintf(stdout, "%s\n", buffer);
     fflush(stdout);
+}
+
+void downstream_add(struct downstream_s *downstream) {
+  struct downstream_node_s *cursor = global.downstreams;
+
+  //struct downstream_node_s new_node;
+  downstream_node_t *new_node;
+  new_node = malloc(sizeof(downstream_node_t));
+  new_node->data = *downstream;
+
+  if (cursor == NULL){
+    global.downstreams = new_node;
+    return;
+  }
+
+  while (cursor->next != NULL )
+    cursor = cursor->next;
+
+  cursor->next = new_node;
+}
+
+void *downstream_refresh(struct downstream_s *ds) {
+    log_msg(INFO, "ds is %s", ds->data_host);
+    while(1) {
+        sleep(global.dns_refresh_interval);
+        // if sockaddr data was copied let's refresh data
+        if (ds->in_addr_new_ready == 0) {
+            get_dns_data(ds);
+        }
+    }
+    return NULL;
 }
 
 void set_current_downstream_host() {
@@ -232,43 +286,43 @@ void downstream_flush_cb(struct ev_loop *loop, struct ev_io *watcher, int revent
 /* this function switches active and flush buffers, registers handler to send data when
  * socket would be ready
  */
-void downstream_schedule_flush() {
+void downstream_schedule_flush(struct downstream_s *ds) {
     int new_socket_fd = 0;
     int i = 0;
     int slot_data_length = 0;
     int active_buffer_length = 0;
     struct ev_io *watcher = NULL;
-    int new_active_buffer_idx = (global.downstream.active_buffer_idx + 1) % DOWNSTREAM_BUF_NUM;
+    int new_active_buffer_idx = (ds->active_buffer_idx + 1) % DOWNSTREAM_BUF_NUM;
     // if active_buffer_idx == flush_buffer_idx this means that all previous
     // flushes are done (no filled buffers in the queue) and we need to schedule new one
-    int need_to_schedule_flush = (global.downstream.active_buffer_idx == global.downstream.flush_buffer_idx);
+    int need_to_schedule_flush = (ds->active_buffer_idx == ds->flush_buffer_idx);
 
-    if (global.downstream.buffer_length[new_active_buffer_idx] > 0) {
+    if (ds->buffer_length[new_active_buffer_idx] > 0) {
         log_msg(ERROR, "%s: previous flush is not completed, loosing data.", __func__);
-        global.downstream.active_buffer_length = 0;
-        global.downstream.slots_used = 0;
+        ds->active_buffer_length = 0;
+        ds->slots_used = 0;
         return;
     }
-    for (i = 0; i < global.downstream.slots_used; i++) {
-        slot_data_length = global.downstream.slots[i].length;
-        if (slot_data_length == global.downstream.slots[i].name_length) {
+    for (i = 0; i < ds->slots_used; i++) {
+        slot_data_length = ds->slots[i].length;
+        if (slot_data_length == ds->slots[i].name_length) {
             continue;
         }
-        *(global.downstream.slots[i].buffer + slot_data_length - 1) = '\n';
-        memcpy(global.downstream.active_buffer + active_buffer_length, global.downstream.slots[i].buffer, slot_data_length);
+        *(ds->slots[i].buffer + slot_data_length - 1) = '\n';
+        memcpy(ds->active_buffer + active_buffer_length, ds->slots[i].buffer, slot_data_length);
         active_buffer_length += slot_data_length;
     }
-    log_msg(TRACE, "%s: flushing buffer: \"%.*s\"", __func__, active_buffer_length, global.downstream.active_buffer);
-    global.downstream.buffer_length[global.downstream.active_buffer_idx] = active_buffer_length;
-    global.downstream.active_buffer = global.downstream.buffer + new_active_buffer_idx * DOWNSTREAM_BUF_SIZE;
-    global.downstream.active_buffer_length = 0;
-    global.downstream.slots_used = 0;
-    global.downstream.active_buffer_idx = new_active_buffer_idx;
+    log_msg(TRACE, "%s: flushing buffer: \"%.*s\"", __func__, active_buffer_length, ds->active_buffer);
+    ds->buffer_length[ds->active_buffer_idx] = active_buffer_length;
+    ds->active_buffer = ds->buffer + new_active_buffer_idx * DOWNSTREAM_BUF_SIZE;
+    ds->active_buffer_length = 0;
+    ds->slots_used = 0;
+    ds->active_buffer_idx = new_active_buffer_idx;
     log_msg(TRACE, "%s: new active buffer idx = %d", __func__, new_active_buffer_idx);
     if (need_to_schedule_flush) {
-        watcher = &(global.downstream.flush_watcher);
-        if (global.downstream.packets_sent > MAX_PACKETS_PER_SOCKET) {
-            global.downstream.packets_sent = 0;
+        watcher = &(ds->flush_watcher);
+        if (ds->packets_sent > MAX_PACKETS_PER_SOCKET) {
+            ds->packets_sent = 0;
             new_socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (new_socket_fd < 0) {
                 log_msg(ERROR, "%s: socket() failed %s", __func__, strerror(errno));
@@ -282,35 +336,42 @@ void downstream_schedule_flush() {
     }
 }
 
-int add_slot(char *line, int name_length) {
-    global.downstream.slots[global.downstream.slots_used].name_length = name_length;
-    global.downstream.slots[global.downstream.slots_used].length = name_length;
-    global.downstream.slots[global.downstream.slots_used].type = TYPE_UNKNOWN;
-    global.downstream.slots[global.downstream.slots_used].counter = 0.0;
-    global.downstream.active_buffer_length += name_length;
-    memcpy(global.downstream.slots[global.downstream.slots_used].buffer, line, name_length);
-    log_msg(TRACE, "%s: created %.*s at slot %d", __func__, name_length, line, global.downstream.slots_used);
-    return global.downstream.slots_used++;
+void downstream_schedule_refresh(struct downstream_s *ds) {
+  pthread_t downstream_socket_refresh_thread;
+  if (! is_valid_ip_address(ds->data_host)) {
+       pthread_create(&downstream_socket_refresh_thread, NULL, downstream_refresh, ds);
+  }
 }
 
-int find_slot(char *line, int name_length) {
+int add_slot(struct downstream_s *ds, char *line, int name_length) {
+    ds->slots[ds->slots_used].name_length = name_length;
+    ds->slots[ds->slots_used].length = name_length;
+    ds->slots[ds->slots_used].type = TYPE_UNKNOWN;
+    ds->slots[ds->slots_used].counter = 0.0;
+    ds->active_buffer_length += name_length;
+    memcpy(ds->slots[ds->slots_used].buffer, line, name_length);
+    log_msg(TRACE, "%s: created %.*s at slot %d", __func__, name_length, line, ds->slots_used);
+    return ds->slots_used++;
+}
+
+int find_slot(struct downstream_s *ds,char *line, int name_length) {
     int i = 0;
-    for (i = 0; i < global.downstream.slots_used; i++) {
-        if (global.downstream.slots[i].name_length == name_length) {
-            if (memcmp(line, global.downstream.slots[i].buffer, name_length) == 0) {
+    for (i = 0; i < ds->slots_used; i++) {
+        if (ds->slots[i].name_length == name_length) {
+            if (memcmp(line, ds->slots[i].buffer, name_length) == 0) {
                 log_msg(TRACE, "%s: found %.*s at slot %d", __func__, name_length, line, i);
                 return i;
             }
         }
     }
-    if (global.downstream.active_buffer_length + name_length > DOWNSTREAM_BUF_SIZE) {
-        log_msg(TRACE, "%s: active_buffer_length = %d, name_length = %d, scheduling flush", __func__, global.downstream.active_buffer_length, name_length);
-        downstream_schedule_flush();
+    if (ds->active_buffer_length + name_length > DOWNSTREAM_BUF_SIZE) {
+        log_msg(TRACE, "%s: active_buffer_length = %d, name_length = %d, scheduling flush", __func__, ds->active_buffer_length, name_length);
+        downstream_schedule_flush(ds);
     }
-    return add_slot(line, name_length);
+    return add_slot(ds,line, name_length);
 }
 
-void insert_values_into_slot(int initial_slot_idx, char *line, char *colon_ptr, int length) {
+void insert_values_into_slot(struct downstream_s *ds, int initial_slot_idx, char *line, char *colon_ptr, int length) {
     int slot_idx = initial_slot_idx;
     ssize_t bytes_in_buffer;
     char *buffer_ptr = colon_ptr + 1;
@@ -359,8 +420,8 @@ void insert_values_into_slot(int initial_slot_idx, char *line, char *colon_ptr, 
         }
         // if metric is counter let's use maximum possible length of resulting string (because of "%.15g|c\n" below)
         if (global.downstream.active_buffer_length + (metric_type == TYPE_COUNTER ? MAX_COUNTER_LENGTH : data_length) > DOWNSTREAM_BUF_SIZE) {
-            downstream_schedule_flush();
-            slot_idx = add_slot(line, name_length);
+            downstream_schedule_flush(ds);
+            slot_idx = add_slot(ds,line, name_length);
             global.downstream.slots[slot_idx].type = metric_type;
         }
         target_ptr = global.downstream.slots[slot_idx].buffer + global.downstream.slots[slot_idx].length;
@@ -412,8 +473,14 @@ int process_data_line(char *line, int length) {
         log_msg(ERROR, "%s: invalid metric %s", __func__, line);
         return 1;
     }
-    slot_idx = find_slot(line, colon_ptr - line + 1);
-    insert_values_into_slot(slot_idx, line, colon_ptr, length);
+    struct downstream_node_s *cursor = global.downstreams;
+
+    while (cursor != NULL){
+      slot_idx = find_slot(&(cursor->data),line, colon_ptr - line + 1);
+      insert_values_into_slot(&(cursor->data),slot_idx, line, colon_ptr, length);
+      cursor = cursor->next;
+    }
+
     return 0;
 }
 
@@ -462,108 +529,94 @@ void udp_read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 }
 
 // this function cycles through downstreams and flushes them on scheduled basis
-void downstream_flush_timer_cb(struct ev_loop *loop, struct ev_periodic *p, int revents) {
-    if (global.downstream.active_buffer_length > 0) {
-        downstream_schedule_flush();
+void downstream_flush_timer_cb(struct downstream_s *ds, struct ev_loop *loop, struct ev_periodic *p, int revents) {
+    if (ds->active_buffer_length > 0) {
+        downstream_schedule_flush(ds);
     }
 }
 
-void get_dns_data() {
+void get_dns_data(struct downstream_s *downstream) {
+
     int i = 0;
     struct in_addr *addr = NULL;
-    struct hostent *he = gethostbyname(global.downstream.data_host);
+    struct hostent *he = gethostbyname(downstream->data_host);
 
     if (he == NULL || he->h_addr_list == NULL || (he->h_addr_list)[0] == NULL ) {
         log_msg(ERROR, "%s: gethostbyname() failed %s", __func__, strerror(errno));
         return;
     }
     for (i = 0; i < MAX_DOWNSTREAM_NUM && he->h_addr_list[i] != NULL; i++) {
-        addr = global.downstream.in_addr_new + i;
+        addr = downstream->in_addr_new + i;
         memcpy(addr, he->h_addr_list[i], he->h_length);
         log_msg(DEBUG, "%s: %s", __func__, inet_ntoa(*(struct in_addr *)(he->h_addr_list[i])));
     }
-    global.downstream.downstream_host_num = i;
-    global.downstream.in_addr_new_ready = 1;
+    downstream->downstream_host_num = i;
+    downstream->in_addr_new_ready = 1;
 }
 
-// function to init downstream from config file line
-int init_downstream(char *hosts) {
-    int i = 0;
-    char *host = hosts;
-    char *data_port_s = NULL;
-    char *health_port_s = NULL;
-    int host_len = 0;
+void through_downstreams(void (*f)(struct downstream_s *ds)){
+  struct downstream_node_s *cursor = global.downstreams;
+  if (cursor == NULL)
+    return;
 
-    // argument line has the following format: host:data_port
-    // now let's initialize downstreams
-    global.downstream.packets_sent = 0;
-    global.downstream.slots_used = 0;
-    global.downstream.downstream_host_num = 0;
-    global.downstream.downstream_hosts = NULL;
-    global.downstream.current_downstream_host = NULL;
-    global.downstream.active_buffer_idx = 0;
-    global.downstream.active_buffer = global.downstream.buffer;
-    global.downstream.active_buffer_length = 0;
-    global.downstream.flush_buffer_idx = 0;
-    global.downstream.flush_watcher.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);;
-    if (global.downstream.flush_watcher.fd < 0) {
+  while (cursor != NULL){
+    (*f)(&(cursor->data));
+    cursor = cursor->next;
+  }
+}
+
+int init_downstream(char *data_host_s, int data_port_s, int health_port_s) {
+    int i = 0;
+
+    int host_len = 0;
+    struct downstream_s ds;
+
+    ds.packets_sent = 0;
+    ds.slots_used = 0;
+    ds.downstream_host_num = 0;
+    ds.downstream_hosts = NULL;
+    ds.current_downstream_host = NULL;
+    ds.active_buffer_idx = 0;
+    ds.active_buffer = global.downstream.buffer;
+    ds.active_buffer_length = 0;
+    ds.flush_buffer_idx = 0;
+    ds.flush_watcher.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+    if (ds.flush_watcher.fd < 0) {
         log_msg(ERROR, "%s: socket() failed %s", __func__, strerror(errno));
         return 1;
     }
+
     for (i = 0; i < DOWNSTREAM_BUF_NUM; i++) {
-        global.downstream.buffer_length[i] = 0;
+        ds.buffer_length[i] = 0;
     }
-    data_port_s = strchr(host, ':');
+
     if (data_port_s == NULL) {
-        log_msg(ERROR, "%s: no data port for %s", __func__, host);
+        log_msg(ERROR, "%s: no data port for %s", __func__, data_host_s);
         return 1;
     }
-    *data_port_s++ = 0;
-    host_len = data_port_s - host;
-    global.downstream.data_host = (char *)malloc(host_len);
-    memcpy(global.downstream.data_host, host, host_len);
-    health_port_s = strchr(data_port_s, ':');
+
+    ds.data_host = data_host_s;
+
     if (health_port_s == NULL) {
-        log_msg(ERROR, "%s: no health port for %s", __func__, host);
+        log_msg(ERROR, "%s: no health port for %s", __func__, data_host_s);
         return 1;
     }
-    *health_port_s++ = 0;
-    global.downstream.data_port = atoi(data_port_s);
-    global.downstream.health_port = atoi(health_port_s);
-    global.downstream.in_addr_new_ready = 0;
-    get_dns_data();
-    if (global.downstream.in_addr_new_ready != 1) {
+
+
+    ds.data_port = data_port_s;
+    ds.health_port = health_port_s;
+    ds.in_addr_new_ready = 0;
+
+    get_dns_data(&ds);
+
+    if (ds.in_addr_new_ready != 1) {
         log_msg(ERROR, "%s: failed to retrieve downstream hosts", __func__);
         return 1;
     }
-    return 0;
-}
 
-// function to parse single line from config file
-int process_config_line(char *line) {
-    // valid line should contain '=' symbol
-    char *value_ptr = strchr(line, '=');
-    if (value_ptr == NULL) {
-        log_msg(ERROR, "%s: bad line in config \"%s\"", __func__, line);
-        return 1;
-    }
-    *value_ptr++ = 0;
-    if (strcmp("data_port", line) == 0) {
-        global.data_port = atoi(value_ptr);
-    } else if (strcmp("downstream_flush_interval", line) == 0) {
-        global.downstream_flush_interval = atof(value_ptr);
-    } else if (strcmp("log_level", line) == 0) {
-        global.log_level = atoi(value_ptr);
-    } else if (strcmp("dns_refresh_interval", line) == 0) {
-        global.dns_refresh_interval = atoi(value_ptr);
-    } else if (strcmp("downstream_health_check_interval", line) == 0) {
-        global.downstream_health_check_interval = atof(value_ptr);
-    } else if (strcmp("downstream", line) == 0) {
-        return init_downstream(value_ptr);
-    } else {
-        log_msg(ERROR, "%s: unknown parameter \"%s\"", __func__, line);
-        return 1;
-    }
+    downstream_add(&ds);
+
     return 0;
 }
 
@@ -577,58 +630,8 @@ void on_sigint(int sig) {
     exit(0);
 }
 
-// this function loads config file and initializes config fields
-int init_config(char *filename) {
-    size_t n = 0;
-    int l = 0;
-    int failures = 0;
-    char *buffer = NULL;
-
-    global.log_level = DEFAULT_LOG_LEVEL;
-    global.dns_refresh_interval = DEFAULT_DNS_REFRESH_INTERVAL;
-    global.downstream_health_check_interval = DEFAULT_DOWNSTREAM_HEALTHCHECK_INTERVAL;
-    FILE *config_file = fopen(filename, "rt");
-    if (config_file == NULL) {
-        log_msg(ERROR, "%s: fopen() failed %s", __func__, strerror(errno));
-        return 1;
-    }
-    // config file can contain very long lines e.g. to specify downstreams
-    // using getline() here since it automatically adjusts buffer
-    while ((l = getline(&buffer, &n, config_file)) > 0) {
-        if (buffer[l - 1] == '\n') {
-            buffer[l - 1] = 0;
-        }
-        if (buffer[0] != '\n' && buffer[0] != '#') {
-            failures += process_config_line(buffer);
-        }
-    }
-    // buffer is reused by getline() so we need to free it only once
-    free(buffer);
-    fclose(config_file);
-    if (failures > 0) {
-        log_msg(ERROR, "%s: failed to load config file", __func__);
-        return 1;
-    }
-    if (signal(SIGHUP, on_sighup) == SIG_ERR) {
-        log_msg(ERROR, "%s: signal() failed", __func__);
-        return 1;
-    }
-    if (signal(SIGINT, on_sigint) == SIG_ERR) {
-        log_msg(ERROR, "%s: signal() failed", __func__);
-        return 1;
-    }
-    return 0;
-}
-
-void *downstream_refresh(void *args) {
-    while(1) {
-        sleep(global.dns_refresh_interval);
-        // if sockaddr data was copied let's refresh data
-        if (global.downstream.in_addr_new_ready == 0) {
-            get_dns_data();
-        }
-    }
-    return NULL;
+void dump_downstream(struct downstream_s *ds) {
+  log_msg(INFO, "dumping ds: %s, %i, %i", ds->data_host, ds->data_port, ds->health_port);
 }
 
 void update_downstreams(struct ev_loop *loop) {
@@ -702,111 +705,111 @@ int setnonblock(int fd) {
     return fcntl(fd, F_SETFL, flags);
 }
 
-void downstream_mark_down(struct ev_io *watcher) {
-    struct downstream_health_client_s *health_client = (struct downstream_health_client_s *)watcher;
-    if (watcher->fd > 0) {
-        close(watcher->fd);
-        watcher->fd = -1;
-    }
-    if (health_client->alive == 1) {
-        health_client->alive = 0;
-        log_msg(DEBUG, "%s: downstream %s is down", __func__, inet_ntoa(health_client->sa_in.sin_addr));
-    }
-}
+// void downstream_mark_down(struct ev_io *watcher) {
+//     struct downstream_health_client_s *health_client = (struct downstream_health_client_s *)watcher;
+//     if (watcher->fd > 0) {
+//         close(watcher->fd);
+//         watcher->fd = -1;
+//     }
+//     if (health_client->alive == 1) {
+//         health_client->alive = 0;
+//         log_msg(DEBUG, "%s: downstream %s is down", __func__, inet_ntoa(health_client->sa_in.sin_addr));
+//     }
+// }
+//
+// void downstream_health_read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+//     struct downstream_health_client_s *health_client = (struct downstream_health_client_s *)watcher;
+//     char buffer[DOWNSTREAM_HEALTH_CHECK_BUF_SIZE];
+//     int health_fd = watcher->fd;
+//     ev_io_stop(loop, watcher);
+//     int n = recv(health_fd, buffer, DOWNSTREAM_HEALTH_CHECK_BUF_SIZE, 0);
+//     if (n <= 0) {
+//         log_msg(WARN, "%s: recv() failed %s", __func__, strerror(errno));
+//         downstream_mark_down(watcher);
+//         return;
+//     }
+//     buffer[n] = 0;
+//     if (memcmp(buffer, HEALTH_CHECK_UP_RESPONSE, STRLEN(HEALTH_CHECK_UP_RESPONSE)) != 0) {
+//         downstream_mark_down(watcher);
+//         return;
+//     }
+//     if (health_client->alive == 0) {
+//         health_client->alive = 1;
+//         log_msg(DEBUG, "%s: downstream %s is up", __func__, inet_ntoa(health_client->sa_in.sin_addr));
+//     }
+// }
+//
+// void downstream_health_send_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+//     int health_fd = watcher->fd;
+//     ev_io_stop(loop, watcher);
+//     int n = send(health_fd, HEALTH_CHECK_REQUEST, STRLEN(HEALTH_CHECK_REQUEST), 0);
+//     if (n <= 0) {
+//         log_msg(WARN, "%s: send() failed %s", __func__, strerror(errno));
+//         downstream_mark_down(watcher);
+//         return;
+//     }
+//     ev_io_init(watcher, downstream_health_read_cb, health_fd, EV_READ);
+//     ev_io_start(loop, watcher);
+// }
+//
+// void downstream_health_connect_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+//     int health_fd = watcher->fd;
+//     int err;
+//
+//     socklen_t len = sizeof(err);
+//     ev_io_stop(loop, watcher);
+//     getsockopt(health_fd, SOL_SOCKET, SO_ERROR, &err, &len);
+//     if (err) {
+//         downstream_mark_down(watcher);
+//         return;
+//     } else {
+//         ev_io_init(watcher, downstream_health_send_cb, health_fd, EV_WRITE);
+//         ev_io_start(loop, watcher);
+//     }
+// }
 
-void downstream_health_read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    struct downstream_health_client_s *health_client = (struct downstream_health_client_s *)watcher;
-    char buffer[DOWNSTREAM_HEALTH_CHECK_BUF_SIZE];
-    int health_fd = watcher->fd;
-    ev_io_stop(loop, watcher);
-    int n = recv(health_fd, buffer, DOWNSTREAM_HEALTH_CHECK_BUF_SIZE, 0);
-    if (n <= 0) {
-        log_msg(WARN, "%s: recv() failed %s", __func__, strerror(errno));
-        downstream_mark_down(watcher);
-        return;
-    }
-    buffer[n] = 0;
-    if (memcmp(buffer, HEALTH_CHECK_UP_RESPONSE, STRLEN(HEALTH_CHECK_UP_RESPONSE)) != 0) {
-        downstream_mark_down(watcher);
-        return;
-    }
-    if (health_client->alive == 0) {
-        health_client->alive = 1;
-        log_msg(DEBUG, "%s: downstream %s is up", __func__, inet_ntoa(health_client->sa_in.sin_addr));
-    }
-}
-
-void downstream_health_send_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    int health_fd = watcher->fd;
-    ev_io_stop(loop, watcher);
-    int n = send(health_fd, HEALTH_CHECK_REQUEST, STRLEN(HEALTH_CHECK_REQUEST), 0);
-    if (n <= 0) {
-        log_msg(WARN, "%s: send() failed %s", __func__, strerror(errno));
-        downstream_mark_down(watcher);
-        return;
-    }
-    ev_io_init(watcher, downstream_health_read_cb, health_fd, EV_READ);
-    ev_io_start(loop, watcher);
-}
-
-void downstream_health_connect_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    int health_fd = watcher->fd;
-    int err;
-
-    socklen_t len = sizeof(err);
-    ev_io_stop(loop, watcher);
-    getsockopt(health_fd, SOL_SOCKET, SO_ERROR, &err, &len);
-    if (err) {
-        downstream_mark_down(watcher);
-        return;
-    } else {
-        ev_io_init(watcher, downstream_health_send_cb, health_fd, EV_WRITE);
-        ev_io_start(loop, watcher);
-    }
-}
-
-void check_downstream_health(struct ev_loop *loop) {
-    struct downstream_host_s *host = NULL;
-    struct ev_io *watcher = NULL;
-    int health_fd = 0;
-    int n = 0;
-    struct downstream_health_client_s *health_client;
-
-    for (host = global.downstream.downstream_hosts; host != NULL; host = host->next) {
-        health_client = &(host->health_client);
-        watcher = (struct ev_io *)health_client;
-        health_fd = watcher->fd;
-        if (health_fd > 0 && ev_is_active(watcher)) {
-            log_msg(WARN, "%s: previous health check request was not completed", __func__);
-            ev_io_stop(loop, watcher);
-            downstream_mark_down(watcher);
-            health_fd = -1;
-        }
-        if (health_fd < 0) {
-            health_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (health_fd == -1) {
-                log_msg(WARN, "%s: socket() failed %s", __func__, strerror(errno));
-                continue;
-            }
-            if (setnonblock(health_fd) == -1) {
-                close(health_fd);
-                log_msg(WARN, "%s: setnonblock() failed %s", __func__, strerror(errno));
-                continue;
-            }
-            n = connect(health_fd, (struct sockaddr *)&(health_client->sa_in), sizeof(health_client->sa_in));
-            if (n == -1 && errno == EINPROGRESS) {
-                ev_io_init(watcher, downstream_health_connect_cb, health_fd, EV_WRITE);
-            } else {
-                log_msg(WARN, "%s: connect() failed %s", __func__, strerror(errno));
-                close(health_fd);
-                continue;
-            }
-        } else {
-            ev_io_init(watcher, downstream_health_send_cb, health_fd, EV_WRITE);
-        }
-        ev_io_start(loop, watcher);
-    }
-}
+// void check_downstream_health(struct ev_loop *loop) {
+//     struct downstream_host_s *host = NULL;
+//     struct ev_io *watcher = NULL;
+//     int health_fd = 0;
+//     int n = 0;
+//     struct downstream_health_client_s *health_client;
+//
+//     for (host = global.downstream.downstream_hosts; host != NULL; host = host->next) {
+//         health_client = &(host->health_client);
+//         watcher = (struct ev_io *)health_client;
+//         health_fd = watcher->fd;
+//         if (health_fd > 0 && ev_is_active(watcher)) {
+//             log_msg(WARN, "%s: previous health check request was not completed", __func__);
+//             ev_io_stop(loop, watcher);
+//             downstream_mark_down(watcher);
+//             health_fd = -1;
+//         }
+//         if (health_fd < 0) {
+//             health_fd = socket(AF_INET, SOCK_STREAM, 0);
+//             if (health_fd == -1) {
+//                 log_msg(WARN, "%s: socket() failed %s", __func__, strerror(errno));
+//                 continue;
+//             }
+//             if (setnonblock(health_fd) == -1) {
+//                 close(health_fd);
+//                 log_msg(WARN, "%s: setnonblock() failed %s", __func__, strerror(errno));
+//                 continue;
+//             }
+//             n = connect(health_fd, (struct sockaddr *)&(health_client->sa_in), sizeof(health_client->sa_in));
+//             if (n == -1 && errno == EINPROGRESS) {
+//                 ev_io_init(watcher, downstream_health_connect_cb, health_fd, EV_WRITE);
+//             } else {
+//                 log_msg(WARN, "%s: connect() failed %s", __func__, strerror(errno));
+//                 close(health_fd);
+//                 continue;
+//             }
+//         } else {
+//             ev_io_init(watcher, downstream_health_send_cb, health_fd, EV_WRITE);
+//         }
+//         ev_io_start(loop, watcher);
+//     }
+// }
 
 void downstream_healthcheck_timer_cb(struct ev_loop *loop, struct ev_periodic *p, int revents) {
     update_downstreams(loop);
@@ -820,44 +823,133 @@ int is_valid_ip_address(char *ip_addr) {
     return result != 0;
 }
 
+int process_arguments(int argc, char *argv[]) {
+
+  int c;
+
+  while ((c = getopt (argc, argv, "abc:")) != -1)
+    switch (c)
+      {
+      case 'c':
+        global.config_file = optarg;
+        break;
+      case '?':
+        if (optopt == 'c')
+          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+        else
+          fprintf (stderr,
+                   "Unknown option character `\\x%x'.\n",
+                   optopt);
+        return 0;
+      default:
+        abort ();
+      }
+  return 1;
+}
+
+int process_config_setting(config_setting_t *setting) {
+  if (setting != NULL) {
+    //log_msg(INFO, "%s, value: %s",(*setting).name, config_setting_get_string(setting));
+
+    if (strcmp("listen_port", (*setting).name) == 0) {
+
+      global.data_port = config_setting_get_int(setting);
+
+    } else if (strcmp("downstream_flush_interval", (*setting).name) == 0) {
+
+      global.downstream_flush_interval = config_setting_get_float(setting);
+
+    } else if (strcmp("log_level", (*setting).name) == 0) {
+
+      global.log_level = config_setting_get_int(setting);
+
+    } else if (strcmp("dns_refresh_interval", (*setting).name) == 0) {
+
+      global.dns_refresh_interval = config_setting_get_int(setting);
+
+    } else if (strcmp("downstream_health_check_interval", (*setting).name) == 0) {
+
+      global.downstream_health_check_interval = config_setting_get_float(setting);
+
+    } else if (strcmp("downstreams", (*setting).name) == 0) {
+
+      log_msg(INFO,"downstreams detected");
+      for (size_t i = 0; i < config_setting_length(setting); i++) {
+        config_setting_t *ds = config_setting_get_elem(setting, i);
+
+        char *name = config_setting_get_string(config_setting_get_member(ds, "name"));
+        char *hostname = config_setting_get_string(config_setting_get_member(ds, "host"));
+        int sink_port = config_setting_get_int(config_setting_get_member(ds, "sink_port"));
+        int healthcheck_port = config_setting_get_int(config_setting_get_member(ds, "healthcheck_port"));
+
+        init_downstream(hostname, sink_port, healthcheck_port);
+      }
+
+    }
+  }
+  return 1;
+}
+
+int read_config(char *config){
+  config_t cfg;
+  config_setting_t *root;
+
+  config_init(&cfg);
+
+  global.log_level = DEFAULT_LOG_LEVEL;
+  global.dns_refresh_interval = DEFAULT_DNS_REFRESH_INTERVAL;
+  global.downstream_health_check_interval = DEFAULT_DOWNSTREAM_HEALTHCHECK_INTERVAL;
+
+  if (!config_read_file(&cfg, global.config_file)) {
+    log_msg(ERROR, "Unable to parse config file: \n %s \n%s \n%s \n%s",
+            config_error_file(&cfg),
+            config_error_line(&cfg),
+            config_error_text(&cfg),
+            global.config_file);
+  }
+
+  root = config_root_setting(&cfg);
+  int root_length = config_setting_length(root);
+
+  for (size_t i = 0; i < config_setting_length(root); i++) {
+    process_config_setting(config_setting_get_elem(root, i));
+  }
+
+  return 1;
+}
+
 int main(int argc, char *argv[]) {
     struct ev_loop *loop = ev_default_loop(0);
     int data_socket;
     struct sockaddr_in addr;
+
     struct ev_io socket_watcher;
     struct ev_periodic downstream_flush_timer_watcher;
     struct ev_periodic downstream_healthcheck_timer_watcher;
+
     ev_tstamp downstream_flush_timer_at = 0.0;
     ev_tstamp downstream_healthcheck_timer_at = 0.0;
-    pthread_t downstream_socket_refresh_thread;
 
-   if (argc != 2) {
-        fprintf(stdout, "Usage: %s config.file\n", argv[0]);
-        exit(1);
+    if (!process_arguments(argc, argv)) {
+      log_msg(ERROR, "Unable to parse argumets, check command!");
     }
-    if (init_config(argv[1]) != 0) {
-        log_msg(ERROR, "%s: init_config() failed", __func__);
-        exit(1);
-    }
+
+    log_msg(INFO, "Using config: %s ", global.config_file);
+    read_config(global.config_file);
+
+    through_downstreams(dump_downstream);
 
     if ((data_socket = socket(PF_INET, SOCK_DGRAM, 0)) < 0 ) {
-        log_msg(ERROR, "%s: socket() error %s", __func__, strerror(errno));
-        return(1);
+         log_msg(ERROR, "%s: socket() error %s", __func__, strerror(errno));
+         return(1);
     }
+
     bzero(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(global.data_port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(data_socket, (struct sockaddr*) &addr, sizeof(addr)) != 0) {
-        log_msg(ERROR, "%s: bind() failed %s", __func__, strerror(errno));
-        return(1);
-    }
-
-    // if downstream is specified via ip address no need to run downstream_refresh()
-    if (! is_valid_ip_address(global.downstream.data_host)) {
-        pthread_create(&downstream_socket_refresh_thread, NULL, downstream_refresh, NULL);
-    }
+    through_downstreams(downstream_schedule_refresh);
 
     ev_io_init(&socket_watcher, udp_read_cb, data_socket, EV_READ);
     ev_io_start(loop, &socket_watcher);
@@ -865,10 +957,10 @@ int main(int argc, char *argv[]) {
     ev_periodic_init (&downstream_flush_timer_watcher, downstream_flush_timer_cb, downstream_flush_timer_at, global.downstream_flush_interval, 0);
     ev_periodic_start (loop, &downstream_flush_timer_watcher);
 
-    ev_periodic_init (&downstream_healthcheck_timer_watcher, downstream_healthcheck_timer_cb, downstream_healthcheck_timer_at, global.downstream_health_check_interval, 0);
-    ev_periodic_start (loop, &downstream_healthcheck_timer_watcher);
+    // ev_periodic_init (&downstream_healthcheck_timer_watcher, downstream_healthcheck_timer_cb, downstream_healthcheck_timer_at, global.downstream_health_check_interval, 0);
+    // ev_periodic_start (loop, &downstream_healthcheck_timer_watcher);
 
-    ev_loop(loop, 0);
-    log_msg(ERROR, "%s: ev_loop() exited", __func__);
+    // ev_loop(loop, 0);
+    // log_msg(ERROR, "%s: ev_loop() exited", __func__);
     return(0);
 }
