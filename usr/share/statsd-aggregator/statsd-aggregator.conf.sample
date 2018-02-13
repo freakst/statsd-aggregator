@@ -1,4 +1,11 @@
-data_port=8125
-downstream_flush_interval=1.0
-downstream=localhost:8126:8126
-log_level=4
+listen_port = 8125;
+log_level = 0;
+downstream_flush_interval = 1.0;
+
+downstreams = (
+  {
+    host = "example.com";
+    sink_port = 8126;
+    healthcheck_port = 0;
+  }
+);
