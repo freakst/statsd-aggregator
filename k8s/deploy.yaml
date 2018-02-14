@@ -1,0 +1,29 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: statsd-aggregator
+  labels:
+     app: statsd
+     name: statsd-aggregator
+     tier: aux-service
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: statsd-aggregator
+      labels:
+        name: statsd-aggregator
+        tier: aux-service
+    spec:
+      containers:
+      - name: statsd-aggregator
+        image: ark0/statsd-aggregator:rc0
+        volumeMounts:
+        - name: statsd-aggregator-cfg-volume
+          mountPath: /etc
+        ports:
+          - containerPort: 8125
+      volumes:
+      - name: statsd-aggregator-cfg-volume
+        configMap:
+           name: statsd-aggregator-cfg

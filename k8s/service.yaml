@@ -1,0 +1,14 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: statsd-aggregator-sink
+spec:
+  loadBalancerIP: 1.2.3.4
+  selector:
+    name: statsd-aggregator
+    tier: aux-service
+  ports:
+  - protocol: UDP
+    port: 8125
+    targetPort: 8125
+  type: LoadBalancer
