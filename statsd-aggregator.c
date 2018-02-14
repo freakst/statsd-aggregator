@@ -257,7 +257,6 @@ void downstream_schedule_flush() {
         log_msg(ERROR, "%s: previous flush is not completed, loosing data.", __func__);
         global.downstream.active_buffer_length = 0;
         global.downstream.slots_used = 0;
-        return;
     }
     for (i = 0; i < global.downstream.slots_used; i++) {
         slot_data_length = global.downstream.slots[i].length;
