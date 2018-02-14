@@ -173,15 +173,22 @@ void log_msg(int level, char *format, ...) {
 }
 
 void set_current_downstream_host() {
-    struct downstream_host_s *host = global.downstream.current_downstream_host;
+    struct downstream_host_s *host;
     int i = 0;
 
-    if (host == NULL) {
+    if (global.downstream.current_downstream_host != NULL) {
+        host = global.downstream.current_downstream_host;
+    } else if (global.downstream.downstream_hosts != NULL) {
         host = global.downstream.downstream_hosts;
-    }
-    if (host == NULL) {
+    } else {
         return;
     }
+
+    if (global.downstream.health_port == 0) {
+      global.downstream.current_downstream_host = host;
+      return;
+    }
+
     for (i = 0; i < global.downstream.downstream_host_num; i++) {
         host = host->next;
         if (host == NULL) {
@@ -489,59 +496,6 @@ void get_dns_data() {
     global.downstream.in_addr_new_ready = 1;
 }
 
-// function to init downstream from config file line
-// int init_downstream(char *hosts) {
-//     int i = 0;
-//     char *host = hosts;
-//     char *data_port_s = NULL;
-//     char *health_port_s = NULL;
-//     int host_len = 0;
-//
-//     // argument line has the following format: host:data_port
-//     // now let's initialize downstreams
-//     global.downstream.packets_sent = 0;
-//     global.downstream.slots_used = 0;
-//     global.downstream.downstream_host_num = 0;
-//     global.downstream.downstream_hosts = NULL;
-//     global.downstream.current_downstream_host = NULL;
-//     global.downstream.active_buffer_idx = 0;
-//     global.downstream.active_buffer = global.downstream.buffer;
-//     global.downstream.active_buffer_length = 0;
-//     global.downstream.flush_buffer_idx = 0;
-//     global.downstream.flush_watcher.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);;
-//     if (global.downstream.flush_watcher.fd < 0) {
-//         log_msg(ERROR, "%s: socket() failed %s", __func__, strerror(errno));
-//         return 1;
-//     }
-//     for (i = 0; i < DOWNSTREAM_BUF_NUM; i++) {
-//         global.downstream.buffer_length[i] = 0;
-//     }
-//     data_port_s = strchr(host, ':');
-//     if (data_port_s == NULL) {
-//         log_msg(ERROR, "%s: no data port for %s", __func__, host);
-//         return 1;
-//     }
-//     *data_port_s++ = 0;
-//     host_len = data_port_s - host;
-//     global.downstream.data_host = (char *)malloc(host_len);
-//     memcpy(global.downstream.data_host, host, host_len);
-//     health_port_s = strchr(data_port_s, ':');
-//     if (health_port_s == NULL) {
-//         log_msg(ERROR, "%s: no health port for %s", __func__, host);
-//         return 1;
-//     }
-//     *health_port_s++ = 0;
-//     global.downstream.data_port = atoi(data_port_s);
-//     global.downstream.health_port = atoi(health_port_s);
-//     global.downstream.in_addr_new_ready = 0;
-//     get_dns_data();
-//     if (global.downstream.in_addr_new_ready != 1) {
-//         log_msg(ERROR, "%s: failed to retrieve downstream hosts", __func__);
-//         return 1;
-//     }
-//     return 0;
-// }
-
 int init_downstream(char *data_host_s, int data_port_s, int health_port_s) {
     int i = 0;
 
@@ -575,11 +529,9 @@ int init_downstream(char *data_host_s, int data_port_s, int health_port_s) {
 
     ds.data_host = data_host_s;
 
-    if (health_port_s == NULL) {
-        log_msg(ERROR, "%s: no health port for %s", __func__, data_host_s);
-        return 1;
+    if (health_port_s == 0) {
+         log_msg(WARN, "%s: health port value is zero, health check disabled for %s", __func__, data_host_s);
     }
-
 
     ds.data_port = data_port_s;
     ds.health_port = health_port_s;
@@ -867,7 +819,9 @@ void check_downstream_health(struct ev_loop *loop) {
 
 void downstream_healthcheck_timer_cb(struct ev_loop *loop, struct ev_periodic *p, int revents) {
     update_downstreams(loop);
-    check_downstream_health(loop);
+    if (global.downstream.health_port != 0) {
+      check_downstream_health(loop);
+    }
 }
 
 // http://stackoverflow.com/questions/791982/determine-if-a-string-is-a-valid-ip-address-in-c
