@@ -18,9 +18,11 @@ spec:
       containers:
       - name: statsd-aggregator
         image: ark0/statsd-aggregator:rc0
+        command: ["./statsd-aggregator"]
+        args: ["-c","/etc/aggregator/aggregator.cfg"]
         volumeMounts:
         - name: statsd-aggregator-cfg-volume
-          mountPath: /etc
+          mountPath: /etc/aggregator
         ports:
           - containerPort: 8125
       volumes:
