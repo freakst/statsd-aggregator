@@ -7,7 +7,7 @@ metadata:
      name: statsd-aggregator
      tier: aux-service
 spec:
-  replicas: 6
+  replicas: 3
   template:
     metadata:
       name: statsd-aggregator
@@ -22,10 +22,10 @@ spec:
         args: ["-c","/etc/aggregator/aggregator.cfg"]
         resources:
           requests:
-            cpu: 200m
+            cpu: 500m
             memory: 10Mi
           limits:
-            cpu: 300m
+            cpu: 600m
             memory: 16Mi
         volumeMounts:
         - name: statsd-aggregator-cfg-volume
