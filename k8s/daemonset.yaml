@@ -22,17 +22,24 @@ spec:
       - key: node-role.kubernetes.io/master
         effect: NoSchedule
       containers:
-      containers:
       - name: statsd-aggregator
         image: ark0/statsd-aggregator:rc0
+        command: ["./statsd-aggregator"]
+        args: ["-c","/etc/aggregator/aggregator.cfg"]
+        resources:
+          requests:
+            cpu: 750m
+            memory: 10Mi
+          limits:
+            cpu: 1000m
+            memory: 16Mi
         volumeMounts:
         - name: statsd-aggregator-cfg-volume
           mountPath: /etc
         ports:
           - containerPort: 8125
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 10
       volumes:
       - name: statsd-aggregator-cfg-volume
         configMap:
            name: statsd-aggregator-cfg
-]
