@@ -548,34 +548,6 @@ int init_downstream(char *data_host_s, int data_port_s, int health_port_s) {
     return 0;
 }
 
-// function to parse single line from config file
-int process_config_line(char *line) {
-    // valid line should contain '=' symbol
-    char *value_ptr = strchr(line, '=');
-    if (value_ptr == NULL) {
-        log_msg(ERROR, "%s: bad line in config \"%s\"", __func__, line);
-        return 1;
-    }
-    *value_ptr++ = 0;
-    if (strcmp("data_port", line) == 0) {
-        global.data_port = atoi(value_ptr);
-    } else if (strcmp("downstream_flush_interval", line) == 0) {
-        global.downstream_flush_interval = atof(value_ptr);
-    } else if (strcmp("log_level", line) == 0) {
-        global.log_level = atoi(value_ptr);
-    } else if (strcmp("dns_refresh_interval", line) == 0) {
-        global.dns_refresh_interval = atoi(value_ptr);
-    } else if (strcmp("downstream_health_check_interval", line) == 0) {
-        global.downstream_health_check_interval = atof(value_ptr);
-    } else if (strcmp("downstream", line) == 0) {
-        //return init_downstream(value_ptr);
-    } else {
-        log_msg(ERROR, "%s: unknown parameter \"%s\"", __func__, line);
-        return 1;
-    }
-    return 0;
-}
-
 // this function is called if SIGHUP is received
 void on_sighup(int sig) {
     log_msg(INFO, "%s: sighup received", __func__);
