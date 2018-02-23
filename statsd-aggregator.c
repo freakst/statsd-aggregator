@@ -24,7 +24,7 @@
 // Size of buffer for outgoing packets. Should be below MTU.
 // TODO Probably should be configured via configuration file?
 #define DOWNSTREAM_BUF_SIZE 1428
-#define DOWNSTREAM_BUF_NUM 16
+#define DOWNSTREAM_BUF_NUM 64
 // Size of other temporary buffers
 #define DATA_BUF_SIZE 4096
 #define LOG_BUF_SIZE 2048
