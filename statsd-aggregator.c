@@ -19,11 +19,12 @@
 #include <errno.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <libconfig.h>
 
 // Size of buffer for outgoing packets. Should be below MTU.
 // TODO Probably should be configured via configuration file?
-#define DOWNSTREAM_BUF_SIZE 1450
-#define DOWNSTREAM_BUF_NUM 16
+#define DOWNSTREAM_BUF_SIZE 1428
+#define DOWNSTREAM_BUF_NUM 64
 // Size of other temporary buffers
 #define DATA_BUF_SIZE 4096
 #define LOG_BUF_SIZE 2048
@@ -116,6 +117,8 @@ struct global_s {
     struct downstream_s downstream;
     // how often we flush data
     ev_tstamp downstream_flush_interval;
+    // config_file location
+    char *config_file;
     // how noisy is our log
     int log_level;
     // how often we want to check if downstream ips were changed
@@ -170,15 +173,22 @@ void log_msg(int level, char *format, ...) {
 }
 
 void set_current_downstream_host() {
-    struct downstream_host_s *host = global.downstream.current_downstream_host;
+    struct downstream_host_s *host;
     int i = 0;
 
-    if (host == NULL) {
+    if (global.downstream.current_downstream_host != NULL) {
+        host = global.downstream.current_downstream_host;
+    } else if (global.downstream.downstream_hosts != NULL) {
         host = global.downstream.downstream_hosts;
-    }
-    if (host == NULL) {
+    } else {
         return;
     }
+
+    if (global.downstream.health_port == 0) {
+      global.downstream.current_downstream_host = host;
+      return;
+    }
+
     for (i = 0; i < global.downstream.downstream_host_num; i++) {
         host = host->next;
         if (host == NULL) {
@@ -247,7 +257,6 @@ void downstream_schedule_flush() {
         log_msg(ERROR, "%s: previous flush is not completed, loosing data.", __func__);
         global.downstream.active_buffer_length = 0;
         global.downstream.slots_used = 0;
-        return;
     }
     for (i = 0; i < global.downstream.slots_used; i++) {
         slot_data_length = global.downstream.slots[i].length;
@@ -486,84 +495,56 @@ void get_dns_data() {
     global.downstream.in_addr_new_ready = 1;
 }
 
-// function to init downstream from config file line
-int init_downstream(char *hosts) {
+int init_downstream(char *data_host_s, int data_port_s, int health_port_s) {
     int i = 0;
-    char *host = hosts;
-    char *data_port_s = NULL;
-    char *health_port_s = NULL;
-    int host_len = 0;
 
-    // argument line has the following format: host:data_port
-    // now let's initialize downstreams
-    global.downstream.packets_sent = 0;
-    global.downstream.slots_used = 0;
-    global.downstream.downstream_host_num = 0;
-    global.downstream.downstream_hosts = NULL;
-    global.downstream.current_downstream_host = NULL;
-    global.downstream.active_buffer_idx = 0;
-    global.downstream.active_buffer = global.downstream.buffer;
-    global.downstream.active_buffer_length = 0;
-    global.downstream.flush_buffer_idx = 0;
-    global.downstream.flush_watcher.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);;
-    if (global.downstream.flush_watcher.fd < 0) {
+    int host_len = 0;
+    struct downstream_s ds;
+
+    ds.packets_sent = 0;
+    ds.slots_used = 0;
+    ds.downstream_host_num = 0;
+    ds.downstream_hosts = NULL;
+    ds.current_downstream_host = NULL;
+    ds.active_buffer_idx = 0;
+    ds.active_buffer = global.downstream.buffer;
+    ds.active_buffer_length = 0;
+    ds.flush_buffer_idx = 0;
+    ds.flush_watcher.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+    if (ds.flush_watcher.fd < 0) {
         log_msg(ERROR, "%s: socket() failed %s", __func__, strerror(errno));
         return 1;
     }
+
     for (i = 0; i < DOWNSTREAM_BUF_NUM; i++) {
-        global.downstream.buffer_length[i] = 0;
+        ds.buffer_length[i] = 0;
     }
-    data_port_s = strchr(host, ':');
+
     if (data_port_s == NULL) {
-        log_msg(ERROR, "%s: no data port for %s", __func__, host);
+        log_msg(ERROR, "%s: no data port for %s", __func__, data_host_s);
         return 1;
     }
-    *data_port_s++ = 0;
-    host_len = data_port_s - host;
-    global.downstream.data_host = (char *)malloc(host_len);
-    memcpy(global.downstream.data_host, host, host_len);
-    health_port_s = strchr(data_port_s, ':');
-    if (health_port_s == NULL) {
-        log_msg(ERROR, "%s: no health port for %s", __func__, host);
-        return 1;
+
+    ds.data_host = data_host_s;
+
+    if (health_port_s == 0) {
+         log_msg(WARN, "%s: health port value is zero, health check disabled for %s", __func__, data_host_s);
     }
-    *health_port_s++ = 0;
-    global.downstream.data_port = atoi(data_port_s);
-    global.downstream.health_port = atoi(health_port_s);
-    global.downstream.in_addr_new_ready = 0;
+
+    ds.data_port = data_port_s;
+    ds.health_port = health_port_s;
+    ds.in_addr_new_ready = 0;
+
+    global.downstream = ds;
+
     get_dns_data();
+
     if (global.downstream.in_addr_new_ready != 1) {
         log_msg(ERROR, "%s: failed to retrieve downstream hosts", __func__);
         return 1;
     }
-    return 0;
-}
 
-// function to parse single line from config file
-int process_config_line(char *line) {
-    // valid line should contain '=' symbol
-    char *value_ptr = strchr(line, '=');
-    if (value_ptr == NULL) {
-        log_msg(ERROR, "%s: bad line in config \"%s\"", __func__, line);
-        return 1;
-    }
-    *value_ptr++ = 0;
-    if (strcmp("data_port", line) == 0) {
-        global.data_port = atoi(value_ptr);
-    } else if (strcmp("downstream_flush_interval", line) == 0) {
-        global.downstream_flush_interval = atof(value_ptr);
-    } else if (strcmp("log_level", line) == 0) {
-        global.log_level = atoi(value_ptr);
-    } else if (strcmp("dns_refresh_interval", line) == 0) {
-        global.dns_refresh_interval = atoi(value_ptr);
-    } else if (strcmp("downstream_health_check_interval", line) == 0) {
-        global.downstream_health_check_interval = atof(value_ptr);
-    } else if (strcmp("downstream", line) == 0) {
-        return init_downstream(value_ptr);
-    } else {
-        log_msg(ERROR, "%s: unknown parameter \"%s\"", __func__, line);
-        return 1;
-    }
     return 0;
 }
 
@@ -577,47 +558,46 @@ void on_sigint(int sig) {
     exit(0);
 }
 
-// this function loads config file and initializes config fields
-int init_config(char *filename) {
-    size_t n = 0;
-    int l = 0;
-    int failures = 0;
-    char *buffer = NULL;
+int process_config_setting(config_setting_t *setting) {
+  if (setting != NULL) {
+    //log_msg(INFO, "%s, value: %s",(*setting).name, config_setting_get_string(setting));
 
-    global.log_level = DEFAULT_LOG_LEVEL;
-    global.dns_refresh_interval = DEFAULT_DNS_REFRESH_INTERVAL;
-    global.downstream_health_check_interval = DEFAULT_DOWNSTREAM_HEALTHCHECK_INTERVAL;
-    FILE *config_file = fopen(filename, "rt");
-    if (config_file == NULL) {
-        log_msg(ERROR, "%s: fopen() failed %s", __func__, strerror(errno));
-        return 1;
+    if (strcmp("listen_port", (*setting).name) == 0) {
+
+      global.data_port = config_setting_get_int(setting);
+
+    } else if (strcmp("downstream_flush_interval", (*setting).name) == 0) {
+
+      global.downstream_flush_interval = config_setting_get_float(setting);
+
+    } else if (strcmp("log_level", (*setting).name) == 0) {
+
+      global.log_level = config_setting_get_int(setting);
+
+    } else if (strcmp("dns_refresh_interval", (*setting).name) == 0) {
+
+      global.dns_refresh_interval = config_setting_get_int(setting);
+
+    } else if (strcmp("downstream_health_check_interval", (*setting).name) == 0) {
+
+      global.downstream_health_check_interval = config_setting_get_float(setting);
+
+    } else if (strcmp("downstreams", (*setting).name) == 0) {
+
+      log_msg(INFO,"downstreams detected");
+      for (size_t i = 0; i < config_setting_length(setting); i++) {
+        config_setting_t *ds = config_setting_get_elem(setting, i);
+
+        char *hostname = config_setting_get_string(config_setting_get_member(ds, "host"));
+        int sink_port = config_setting_get_int(config_setting_get_member(ds, "sink_port"));
+        int healthcheck_port = config_setting_get_int(config_setting_get_member(ds, "healthcheck_port"));
+
+        init_downstream(hostname, sink_port, healthcheck_port);
+      }
+
     }
-    // config file can contain very long lines e.g. to specify downstreams
-    // using getline() here since it automatically adjusts buffer
-    while ((l = getline(&buffer, &n, config_file)) > 0) {
-        if (buffer[l - 1] == '\n') {
-            buffer[l - 1] = 0;
-        }
-        if (buffer[0] != '\n' && buffer[0] != '#') {
-            failures += process_config_line(buffer);
-        }
-    }
-    // buffer is reused by getline() so we need to free it only once
-    free(buffer);
-    fclose(config_file);
-    if (failures > 0) {
-        log_msg(ERROR, "%s: failed to load config file", __func__);
-        return 1;
-    }
-    if (signal(SIGHUP, on_sighup) == SIG_ERR) {
-        log_msg(ERROR, "%s: signal() failed", __func__);
-        return 1;
-    }
-    if (signal(SIGINT, on_sigint) == SIG_ERR) {
-        log_msg(ERROR, "%s: signal() failed", __func__);
-        return 1;
-    }
-    return 0;
+  }
+  return 1;
 }
 
 void *downstream_refresh(void *args) {
@@ -810,7 +790,9 @@ void check_downstream_health(struct ev_loop *loop) {
 
 void downstream_healthcheck_timer_cb(struct ev_loop *loop, struct ev_periodic *p, int revents) {
     update_downstreams(loop);
-    check_downstream_health(loop);
+    if (global.downstream.health_port != 0) {
+      check_downstream_health(loop);
+    }
 }
 
 // http://stackoverflow.com/questions/791982/determine-if-a-string-is-a-valid-ip-address-in-c
@@ -818,6 +800,67 @@ int is_valid_ip_address(char *ip_addr) {
     struct sockaddr_in sa;
     int result = inet_pton(AF_INET, ip_addr, &(sa.sin_addr));
     return result != 0;
+}
+
+int process_arguments(int argc, char *argv[]) {
+
+  int c;
+
+  while ((c = getopt (argc, argv, "abc:")) != -1)
+    switch (c)
+      {
+      case 'c':
+        global.config_file = optarg;
+        break;
+      case '?':
+        if (optopt == 'c')
+          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+        else
+          fprintf (stderr,
+                   "Unknown option character `\\x%x'.\n",
+                   optopt);
+        return 0;
+      default:
+        abort ();
+      }
+  return 1;
+}
+
+int read_config(char *config){
+  config_t cfg;
+  config_setting_t *root;
+
+  config_init(&cfg);
+
+  global.log_level = DEFAULT_LOG_LEVEL;
+  global.dns_refresh_interval = DEFAULT_DNS_REFRESH_INTERVAL;
+  global.downstream_health_check_interval = DEFAULT_DOWNSTREAM_HEALTHCHECK_INTERVAL;
+
+  if (!config_read_file(&cfg, global.config_file)) {
+    log_msg(ERROR, "Unable to parse config file: \n %s \n%s \n%s \n%s",
+            config_error_file(&cfg),
+            config_error_line(&cfg),
+            config_error_text(&cfg),
+            global.config_file);
+  }
+
+  root = config_root_setting(&cfg);
+  int root_length = config_setting_length(root);
+
+  for (size_t i = 0; i < config_setting_length(root); i++) {
+    process_config_setting(config_setting_get_elem(root, i));
+  }
+
+  if (signal(SIGHUP, on_sighup) == SIG_ERR) {
+      log_msg(ERROR, "%s: signal() failed", __func__);
+      return 1;
+  }
+  if (signal(SIGINT, on_sigint) == SIG_ERR) {
+      log_msg(ERROR, "%s: signal() failed", __func__);
+      return 1;
+  }
+
+  return 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -831,19 +874,18 @@ int main(int argc, char *argv[]) {
     ev_tstamp downstream_healthcheck_timer_at = 0.0;
     pthread_t downstream_socket_refresh_thread;
 
-   if (argc != 2) {
-        fprintf(stdout, "Usage: %s config.file\n", argv[0]);
-        exit(1);
+    if (!process_arguments(argc, argv)) {
+         log_msg(ERROR, "Unable to parse argumets, check command!");
     }
-    if (init_config(argv[1]) != 0) {
-        log_msg(ERROR, "%s: init_config() failed", __func__);
-        exit(1);
-    }
+
+    log_msg(INFO, "Using config: %s ", global.config_file);
+    read_config(global.config_file);
 
     if ((data_socket = socket(PF_INET, SOCK_DGRAM, 0)) < 0 ) {
         log_msg(ERROR, "%s: socket() error %s", __func__, strerror(errno));
         return(1);
     }
+
     bzero(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(global.data_port);

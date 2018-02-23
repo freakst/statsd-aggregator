@@ -1,0 +1,38 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: statsd-aggregator
+  labels:
+     app: statsd
+     name: statsd-aggregator
+     tier: aux-service
+spec:
+  replicas: 3
+  template:
+    metadata:
+      name: statsd-aggregator
+      labels:
+        name: statsd-aggregator
+        tier: aux-service
+    spec:
+      containers:
+      - name: statsd-aggregator
+        image: ark0/statsd-aggregator:rc0
+        command: ["./statsd-aggregator"]
+        args: ["-c","/etc/aggregator/aggregator.cfg"]
+        resources:
+          requests:
+            cpu: 500m
+            memory: 10Mi
+          limits:
+            cpu: 600m
+            memory: 16Mi
+        volumeMounts:
+        - name: statsd-aggregator-cfg-volume
+          mountPath: /etc/aggregator
+        ports:
+          - containerPort: 8125
+      volumes:
+      - name: statsd-aggregator-cfg-volume
+        configMap:
+           name: statsd-aggregator-cfg

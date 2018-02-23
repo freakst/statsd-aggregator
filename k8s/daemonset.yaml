@@ -1,0 +1,44 @@
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: statsd-aggregator
+  labels:
+     app: statsd
+     name: statsd-aggregator
+     tier: aux-service
+spec:
+  template:
+    metadata:
+      name: statsd-aggregator
+      labels:
+        name: statsd-aggregator
+        tier: aux-service
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: statsd-aggregator
+        image: ark0/statsd-aggregator:rc0
+        command: ["./statsd-aggregator"]
+        args: ["-c","/etc/aggregator/aggregator.cfg"]
+        resources:
+          requests:
+            cpu: 400m
+            memory: 32Mi
+          limits:
+            cpu: 750m
+            memory: 96Mi
+        volumeMounts:
+        - name: statsd-aggregator-cfg-volume
+          mountPath: /etc/aggregator
+        ports:
+          - containerPort: 8125
+            protocol: UDP
+            hostPort: 8125
+            name: statsd
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: statsd-aggregator-cfg-volume
+        configMap:
+           name: statsd-aggregator-cfg
