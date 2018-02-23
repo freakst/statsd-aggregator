@@ -25,10 +25,10 @@ spec:
         resources:
           requests:
             cpu: 400m
-            memory: 10Mi
+            memory: 32Mi
           limits:
             cpu: 750m
-            memory: 16Mi
+            memory: 96Mi
         volumeMounts:
         - name: statsd-aggregator-cfg-volume
           mountPath: /etc/aggregator

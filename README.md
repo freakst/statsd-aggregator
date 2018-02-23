@@ -28,10 +28,9 @@ test.timer:23|ms:51|ms
 
 ## How to compile and install
 
-Please ensure you have a development version of libev installed
+Please ensure you have a development version of libev and libconfig installed
 
-* redhat/centos: `yum install libev-devel`
-* debian/ubuntu: `apt-get install libev-dev`
+* debian/ubuntu: `apt-get install libev-dev libconfig++-dev libconfig-dev`
 
 ```
 $ make install
